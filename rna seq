@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+
+import os
+import glob
+import subprocess
+import sys
+import shutil
+
+# -------------------------------
+# SAFE PATH CONFIG (FIXED)
+# -------------------------------
+HOME = os.path.expanduser("~")
+BASE_DIR = os.path.join(HOME, "rna_seq_project")
+
+DATA_DIR = os.path.join(BASE_DIR, "data", "raw")
+TRIM_DIR = os.path.join(BASE_DIR, "data", "trimmed")
+QC_DIR = os.path.join(BASE_DIR, "results", "qc")
+QUANT_DIR = os.path.join(BASE_DIR, "results", "quants")
+REF_DIR = os.path.join(BASE_DIR, "ref")
+
+FASTA = os.path.join(REF_DIR, "Homo_sapiens.GRCh38.cdna.all.fa")
+SALMON_INDEX = os.path.join(REF_DIR, "salmon_index")
+
+THREADS = "4"
+SRA_ID = "SRR37945512"
+
+# -------------------------------
+# Check tools
+# -------------------------------
+def check_tool(tool):
+    if shutil.which(tool) is None:
+        print(f"ERROR: {tool} not found. Install it first.")
+        sys.exit(1)
+
+for tool in ["fasterq-dump", "fastqc", "fastp", "salmon", "multiqc", "wget", "gzip"]:
+    check_tool(tool)
+
+# -------------------------------
+# Create directories (SAFE)
+# -------------------------------
+for d in [DATA_DIR, TRIM_DIR, QC_DIR, QUANT_DIR, REF_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+print(f"Working directory: {BASE_DIR}")
+
+# -------------------------------
+# Step 1: Download SRA
+# -------------------------------
+r1 = os.path.join(DATA_DIR, f"{SRA_ID}_1.fastq.gz")
+r2 = os.path.join(DATA_DIR, f"{SRA_ID}_2.fastq.gz")
+
+if not (os.path.exists(r1) and os.path.exists(r2)):
+    print(f"Downloading {SRA_ID}...")
+
+    subprocess.run([
+        "fasterq-dump", SRA_ID,
+        "-O", DATA_DIR,
+        "--split-files",
+        "-e", THREADS
+    ], check=True)
+
+    subprocess.run(["gzip", os.path.join(DATA_DIR, f"{SRA_ID}_1.fastq")])
+    subprocess.run(["gzip", os.path.join(DATA_DIR, f"{SRA_ID}_2.fastq")])
+else:
+    print("FASTQ already exists")
+
+# -------------------------------
+# Step 2: Download reference
+# -------------------------------
+if not os.path.exists(FASTA):
+    print("Downloading reference...")
+
+    subprocess.run([
+        "wget",
+        "-P", REF_DIR,
+        "https://ftp.ensembl.org/pub/release-115/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz"
+    ], check=True)
+
+    subprocess.run([
+        "gunzip",
+        os.path.join(REF_DIR, "Homo_sapiens.GRCh38.cdna.all.fa.gz")
+    ], check=True)
+
+# -------------------------------
+# Step 3: Build Salmon index
+# -------------------------------
+if not os.path.exists(SALMON_INDEX):
+    print("Building Salmon index...")
+
+    subprocess.run([
+        "salmon", "index",
+        "-t", FASTA,
+        "-i", SALMON_INDEX,
+        "-p", THREADS
+    ], check=True)
+
+# -------------------------------
+# Step 4: Find FASTQ
+# -------------------------------
+r1_files = sorted(glob.glob(os.path.join(DATA_DIR, "*_1.fastq.gz")))
+
+if not r1_files:
+    print("No FASTQ files found")
+    sys.exit(1)
+
+pairs = []
+all_raw = []
+
+for r1 in r1_files:
+    r2 = r1.replace("_1.fastq.gz", "_2.fastq.gz")
+    if os.path.exists(r2):
+        pairs.append((r1, r2))
+        all_raw.extend([r1, r2])
+
+# -------------------------------
+# Step 5: FastQC raw
+# -------------------------------
+print("Running FastQC (raw)...")
+subprocess.run(["fastqc", *all_raw, "-o", QC_DIR], check=True)
+
+# -------------------------------
+# Step 6: fastp
+# -------------------------------
+trimmed = []
+
+for r1, r2 in pairs:
+    sample = os.path.basename(r1).replace("_1.fastq.gz", "")
+
+    out1 = os.path.join(TRIM_DIR, f"{sample}_1.trim.fastq.gz")
+    out2 = os.path.join(TRIM_DIR, f"{sample}_2.trim.fastq.gz")
+
+    subprocess.run([
+        "fastp",
+        "-i", r1,
+        "-I", r2,
+        "-o", out1,
+        "-O", out2,
+        "--thread", THREADS
+    ], check=True)
+
+    trimmed.append((out1, out2))
+
+# -------------------------------
+# Step 7: FastQC trimmed
+# -------------------------------
+all_trim = [f for p in trimmed for f in p]
+
+print("Running FastQC (trimmed)...")
+subprocess.run(["fastqc", *all_trim, "-o", QC_DIR], check=True)
+
+# -------------------------------
+# Step 8: MultiQC
+# -------------------------------
+print("Running MultiQC...")
+subprocess.run(["multiqc", QC_DIR, "-o", QC_DIR], check=True)
+
+# -------------------------------
+# Step 9: Salmon
+# -------------------------------
+for r1, r2 in trimmed:
+    sample = os.path.basename(r1).split("_1.trim")[0]
+    outdir = os.path.join(QUANT_DIR, sample)
+
+    subprocess.run([
+        "salmon", "quant",
+        "-i", SALMON_INDEX,
+        "-l", "A",
+        "-1", r1,
+        "-2", r2,
+        "-p", THREADS,
+        "-o", outdir
+    ], check=True)
+
+print("Pipeline completed successfully!")
